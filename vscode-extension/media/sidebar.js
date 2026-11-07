@@ -2,6 +2,7 @@ const vscode = acquireVsCodeApi();
 const $ = id => document.getElementById(id);
 let currentPlan;
 let detectedTests = [];
+let currentAgent;
 
 function send(type, value = {}) { vscode.postMessage({ type, value }); }
 function node(tag, className, text) {
@@ -42,6 +43,30 @@ $("add-local").addEventListener("click", () => send("addLocal"));
 $("git-diff").addEventListener("click", () => send("gitDiff"));
 $("screenshot").addEventListener("click", () => send("screenshot"));
 $("output").addEventListener("click", () => send("showOutput"));
+$("agent-select-repo").addEventListener("click", () => send("agentSelectRepository"));
+$("agent-configure-key").addEventListener("click", () => send("agentConfigureKey"));
+$("agent-clone-repo").addEventListener("click", () => send("agentCloneRepository", {
+  url: $("agent-github-url").value.trim()
+}));
+$("agent-start").addEventListener("click", () => {
+  const task = $("agent-task").value.trim();
+  if (!task) { $("notice").textContent = "Describe the development task first."; return; }
+  send("agentStart", { task, provider: $("agent-provider").value, model: $("agent-model").value,
+    baseUrl: $("agent-base-url").value, durationHours: $("agent-duration").value,
+    paceSeconds: $("agent-pace").value });
+});
+$("agent-pause").addEventListener("click", () => send("agentPause"));
+$("agent-resume").addEventListener("click", () => send("agentResume", { provider: $("agent-provider").value }));
+$("agent-stop").addEventListener("click", () => send("agentStop"));
+$("agent-report").addEventListener("click", () => send("agentReport"));
+$("agent-validate").addEventListener("click", () => send("agentValidate", {
+  command: $("agent-validation-command").value.trim()
+}));
+$("agent-rollback").addEventListener("click", () => {
+  const id = currentAgent?.checkpoints?.at(-1);
+  if (id) send("agentRollback", { checkpointId: id });
+  else $("notice").textContent = "This session has no edit checkpoint to restore.";
+});
 $("run-tests").addEventListener("click", () => {
   if (detectedTests.length) send("runTests", { command: detectedTests });
 });
@@ -66,6 +91,10 @@ window.addEventListener("message", event => {
   const message = event.data;
   $("notice").textContent = "";
   if (message.type === "overview") renderOverview(message.value);
+  if (message.type === "agentStatus") renderAgent(message.value);
+  if (message.type === "agentRepository") $("agent-repository").textContent = message.value;
+  if (message.type === "agentReport") renderAgentReport(message.value);
+  if (message.type === "agentValidation") renderAgentValidation(message.value);
   if (message.type === "desktopStatus") renderDesktopStatus(message.value);
   if (message.type === "desktopStop") $("activity").lastElementChild.textContent = "Emergency stop requested";
   if (message.type === "inspection") renderInspection(message.value);
@@ -93,6 +122,15 @@ function renderOverview(data) {
   renderInspection(data.inspection);
   if (data.desktopTasks?.length) renderDesktopStatus(data.desktopTasks[0]);
   renderDesktopQueue(data.desktopTasks || []);
+  $("agent-repository").textContent = data.agentRepository || data.inspection.root;
+  if (data.agentConfig) {
+    $("agent-provider").value = data.agentConfig.provider || "openai";
+    $("agent-model").value = data.agentConfig.model || "";
+    $("agent-base-url").value = data.agentConfig.baseUrl || "";
+  }
+  const agent = data.agentSessions?.find(session => ["queued", "running", "paused", "interrupted"].includes(session.status))
+    || data.agentSessions?.[0];
+  if (agent) renderAgent(agent);
   clear("repositories");
   for (const repo of data.repositories) {
     const card = node("article", "item");
@@ -109,6 +147,59 @@ function renderOverview(data) {
     card.append(node("div", "meta", entry.created_at));
     $("history-list").append(card);
   }
+}
+
+function renderAgent(session) {
+  if (!session) return;
+  currentAgent = session;
+  const box = $("agent-status");
+  box.className = `result-box ${session.status === "failed" ? "bad" : session.status === "completed" ? "good" : ""}`;
+  box.replaceChildren();
+  box.append(node("strong", "", `${String(session.status).toUpperCase()} · iteration ${session.iteration}/${session.max_iterations}`));
+  box.append(node("div", "description", session.task || ""));
+  if (session.workspace) box.append(node("div", "meta", `Isolated workspace: ${session.workspace}`));
+  if (session.phase) box.append(node("div", "meta", `Now: ${session.phase}`));
+  if (session.summary) box.append(node("div", "description", session.summary));
+  if (session.stream_preview) box.append(node("pre", "stream-preview", session.stream_preview));
+  if (session.next_task) box.append(node("div", "meta", `Next: ${session.next_task}`));
+  const usage = session.token_usage || {};
+  box.append(node("div", "meta", `Provider: ${session.provider}/${session.model} · requests ${usage.requests || 0} · tokens ${(usage.prompt_tokens || 0) + (usage.completion_tokens || 0)}`));
+  if (session.changed_files?.length) box.append(node("div", "meta", `Files changed: ${session.changed_files.join(", ")}`));
+  if (session.copy) box.append(node("div", "meta", `Local copy: ${session.copy.copied_files} files · protected secrets excluded: ${session.copy.skipped_secrets}`));
+  if (session.validation) box.append(node("div", session.validation.returncode === 0 ? "good" : "bad",
+    `Validation ${session.validation.returncode === 0 ? "passed" : session.validation.timed_out ? "timed out" : "failed"} · ${session.validation.command.join(" ")}`));
+  if (session.last_error) box.append(node("div", "bad", session.last_error));
+  clear("agent-journal");
+  for (const event of (session.recent_activity || [])) {
+    const item = node("article", "item");
+    item.append(node("div", "meta", `${event.category.toUpperCase()} · ${event.created_at}`));
+    item.append(node("div", "description", event.message));
+    $("agent-journal").append(item);
+  }
+  for (const checkpoint of (session.checkpoints || []).slice(-5).reverse()) {
+    const item = node("article", "item");
+    item.append(node("div", "meta", `Checkpoint ${checkpoint}`));
+    $("agent-journal").append(item);
+  }
+  $("agent-resume").disabled = !["paused", "interrupted"].includes(session.status);
+  $("agent-pause").disabled = !["queued", "running"].includes(session.status);
+  $("agent-stop").disabled = !["queued", "running", "paused", "interrupted"].includes(session.status);
+  $("agent-rollback").disabled = !(session.checkpoints || []).length;
+  $("agent-validate").disabled = !["paused", "interrupted", "completed", "stopped"].includes(session.status);
+}
+
+function renderAgentValidation(result) {
+  const item = node("article", "item");
+  item.append(node("strong", result.returncode === 0 ? "good" : "bad",
+    `${result.returncode === 0 ? "PASS" : result.timed_out ? "TIMEOUT" : "FAIL"} · ${result.command.join(" ")}`));
+  item.append(node("pre", "stream-preview", `${result.stdout || ""}${result.stderr ? `\n${result.stderr}` : ""}`));
+  $("agent-journal").prepend(item);
+}
+
+function renderAgentReport(report) {
+  renderAgent(report.session);
+  const box = node("pre", "result-box", report.diff || "No changes recorded.");
+  $("agent-journal").prepend(box);
 }
 
 function renderInspection(data) {

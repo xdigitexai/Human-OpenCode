@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import json
 import re
 import socket
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
+from opencode_human_bot.autonomous import ChatProvider, ProviderConfig, ProviderError
 from opencode_human_bot.desktop import DesktopController, DesktopError
 from opencode_human_bot.engine import CodingEngine, safe_path
 from opencode_human_bot.languages import ADAPTERS, LanguageAdapter
@@ -377,6 +381,7 @@ def test_desktop_worker_opens_verifies_types_and_saves(repositories, monkeypatch
     monkeypatch.setattr(DesktopController, "_pyautogui", staticmethod(lambda: fake))
     monkeypatch.setattr(DesktopController, "_foreground_process", staticmethod(lambda: "code.exe"))
     monkeypatch.setattr(DesktopController, "_foreground_title", staticmethod(lambda: "target - Visual Studio Code"))
+    monkeypatch.setattr(DesktopController, "_foreground_identity", staticmethod(lambda: {"hwnd": 1, "pid": 1}))
     plan = engine.create_plan("calculate Python")
     plan = engine.add_exact_replacement(plan["id"], 0, "target.py", "return value", "return value + 1")
 
@@ -397,6 +402,174 @@ def test_desktop_worker_opens_verifies_types_and_saves(repositories, monkeypatch
     assert (target / "target.py").read_text().endswith("return value + 1\n")
     assert any(action[0] == "move" for action in fake.actions)
     assert any(action[0] == "scroll" for action in fake.actions)
+
+
+def _wait_for_agent(agent, session_id: str, statuses: set[str], timeout: float = 5) -> dict:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = agent.status(session_id)
+        if status["status"] in statuses:
+            return status
+        time.sleep(0.01)
+    raise AssertionError(f"Session did not reach {statuses}: {agent.status(session_id)}")
+
+
+def test_autonomous_session_edits_only_isolated_copy_and_tracks_multi_file_checkpoints(tmp_path, monkeypatch):
+    source = tmp_path / "real-project"
+    source.mkdir()
+    original = "def value():\n    return 1\n"
+    (source / "app.py").write_text(original, encoding="utf-8")
+    (source / "README.md").write_text("# Fixture\n", encoding="utf-8")
+    (source / ".env").write_text("API_TOKEN=very-secret-value\n", encoding="utf-8")
+    (source / "credentials.json").write_text('{"password":"super-secret-value"}', encoding="utf-8")
+    host = tmp_path / "host"
+    host.mkdir()
+    engine = CodingEngine(host, tmp_path / "state.sqlite3")
+
+    class FakeProvider:
+        def __init__(self, config):
+            assert config.api_key == "not-stored-api-secret"
+
+        def complete(self, messages, on_delta=None):
+            assert "README.md" in messages[-1]["content"]
+            payload = {"done": True, "summary": "Implemented the requested fixture change.",
+                       "next_task": "", "review": "Reviewed the two-file change.",
+                       "changes": [{"path": "app.py", "content": "def value():\n    return 42\n"},
+                                   {"path": "new.py", "content": "ANSWER = 42\n"}]}
+            content = json.dumps(payload)
+            if on_delta:
+                on_delta(content)
+            return {"choices": [{"message": {"content": content}}],
+                    "usage": {"prompt_tokens": 123, "completion_tokens": 45}}
+
+    monkeypatch.setattr("opencode_human_bot.autonomous.ChatProvider", FakeProvider)
+    try:
+        session = engine.autonomous.start(source, "Return the answer", api_key="not-stored-api-secret",
+                                          duration_seconds=60, max_iterations=2, approved=True)
+        result = _wait_for_agent(engine.autonomous, session["id"], {"completed", "failed"})
+        assert result["status"] == "completed", result
+        workspace = Path(result["workspace"])
+        assert (source / "app.py").read_text(encoding="utf-8") == original
+        assert (workspace / "app.py").read_text(encoding="utf-8").endswith("return 42\n")
+        assert (workspace / "new.py").read_text(encoding="utf-8") == "ANSWER = 42\n"
+        assert not (workspace / ".env").exists()
+        assert not (workspace / "credentials.json").exists()
+        assert result["copy"]["skipped_secrets"] == 2
+        branch = __import__("subprocess").run(["git", "-C", str(workspace), "branch", "--show-current"],
+                                              capture_output=True, text=True, check=True).stdout.strip()
+        assert branch.startswith("agent/")
+        assert result["token_usage"] == {"prompt_tokens": 123, "completion_tokens": 45, "requests": 1}
+        report = engine.autonomous.report(session["id"])
+        assert "return 42" in report["diff"] and "new.py" in report["diff"]
+        assert result["checkpoints"]
+        db_values = engine.store.execute("SELECT state_json FROM agent_sessions WHERE id=?", (session["id"],)).fetchone()[0]
+        assert "not-stored-api-secret" not in db_values
+    finally:
+        engine.close()
+
+
+def test_autonomous_stop_does_not_apply_in_flight_model_response(tmp_path, monkeypatch):
+    source = tmp_path / "project"
+    source.mkdir()
+    (source / "module.py").write_text("value = 1\n", encoding="utf-8")
+    host = tmp_path / "host"
+    host.mkdir()
+    engine = CodingEngine(host, tmp_path / "state.sqlite3")
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingProvider:
+        def __init__(self, config):
+            pass
+
+        def complete(self, messages, on_delta=None):
+            started.set()
+            assert release.wait(3)
+            content = json.dumps({
+                "done": True, "summary": "Would change module", "changes": [
+                    {"path": "module.py", "content": "value = 2\n"}]})
+            if on_delta:
+                on_delta(content)
+            return {"choices": [{"message": {"content": content}}], "usage": {}}
+
+    monkeypatch.setattr("opencode_human_bot.autonomous.ChatProvider", BlockingProvider)
+    try:
+        session = engine.autonomous.start(source, "Change the value", api_key="ephemeral-key",
+                                          duration_seconds=60, approved=True)
+        assert started.wait(2)
+        engine.autonomous.stop(session["id"])
+        release.set()
+        result = _wait_for_agent(engine.autonomous, session["id"], {"stopped", "failed"})
+        assert result["status"] == "stopped", result
+        assert (Path(result["workspace"]) / "module.py").read_text(encoding="utf-8") == "value = 1\n"
+        assert result["checkpoints"] == []
+    finally:
+        release.set()
+        engine.close()
+
+
+def test_autonomous_pause_and_resume_at_safe_checkpoint(tmp_path, monkeypatch):
+    source = tmp_path / "project"
+    source.mkdir()
+    (source / "module.py").write_text("value = 1\n", encoding="utf-8")
+    host = tmp_path / "host"
+    host.mkdir()
+    engine = CodingEngine(host, tmp_path / "state.sqlite3")
+    started = threading.Event()
+    release = threading.Event()
+
+    class PausableProvider:
+        def __init__(self, config):
+            pass
+
+        def complete(self, messages, on_delta=None):
+            if not started.is_set():
+                started.set()
+                assert release.wait(3)
+                payload = {"done": False, "summary": "Checkpoint before continuing", "changes": []}
+            else:
+                payload = {"done": True, "summary": "Completed on resume", "changes": [
+                    {"path": "module.py", "content": "value = 2\n"}]}
+            content = json.dumps(payload)
+            if on_delta:
+                on_delta(content)
+            return {"choices": [{"message": {"content": content}}], "usage": {}}
+
+    monkeypatch.setattr("opencode_human_bot.autonomous.ChatProvider", PausableProvider)
+    try:
+        session = engine.autonomous.start(source, "Change the value", api_key="ephemeral-key",
+                                          duration_seconds=60, approved=True)
+        assert started.wait(2)
+        engine.autonomous.pause(session["id"])
+        release.set()
+        paused = _wait_for_agent(engine.autonomous, session["id"], {"paused", "failed"})
+        assert paused["status"] == "paused", paused
+        resumed = engine.autonomous.resume(session["id"])
+        completed = _wait_for_agent(engine.autonomous, resumed["id"], {"completed", "failed"})
+        assert completed["status"] == "completed", completed
+        assert (Path(completed["workspace"]) / "module.py").read_text(encoding="utf-8") == "value = 2\n"
+    finally:
+        release.set()
+        engine.close()
+
+
+def test_autonomous_provider_and_path_safety(tmp_path, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "")
+    with pytest.raises(ValueError, match="Set OPENAI_API_KEY"):
+        ProviderConfig.from_environment("openai")
+    with pytest.raises(ValueError, match="HTTPS"):
+        ProviderConfig.from_environment("openai-compatible", model="test", base_url="http://example.com",
+                                        api_key_value="secret")
+    host = tmp_path / "host"
+    host.mkdir()
+    engine = CodingEngine(host, tmp_path / "state.sqlite3")
+    try:
+        workspace = host
+        for path in ("../outside.py", ".env", "deployment/prod.yaml", "terraform/main.tf", ".git/config"):
+            with pytest.raises(ValueError):
+                engine.autonomous._validate_edit_path(workspace, path)
+    finally:
+        engine.close()
 
 
 def test_unlicensed_source_is_not_selected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -440,3 +613,211 @@ def test_language_adapter_parses_real_grammar(language: str, source: str):
     symbols, error = adapter.parse(source.encode())
     assert error is None
     assert symbols, f"No function or class structures extracted for {language}"
+
+
+
+def test_provider_retries_rate_limit_and_streams_response(monkeypatch):
+    import io
+    import urllib.error
+    from email.message import Message
+
+    config = ProviderConfig.from_environment("openai-compatible", model="test", base_url="http://127.0.0.1:8080",
+                                             api_key_value="test-key")
+    provider = ChatProvider(config)
+    calls = 0
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return iter([b'data: {"choices":[{"delta":{"content":"{\\"done\\":true}"}}]}\n',
+                         b'data: [DONE]\n'])
+
+    def fake_urlopen(request, timeout):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            headers = Message()
+            headers["Retry-After"] = "0"
+            raise urllib.error.HTTPError(request.full_url, 429, "rate limit", headers, io.BytesIO(b"busy"))
+        return Response()
+
+    monkeypatch.setattr("opencode_human_bot.autonomous.urllib.request.urlopen", fake_urlopen)
+    chunks = []
+    response = provider.complete([{"role": "user", "content": "test"}], on_delta=chunks.append)
+    assert calls == 2
+    assert "".join(chunks) == '{"done":true}'
+    assert response["choices"][0]["message"]["content"] == '{"done":true}'
+
+    def unauthorized(request, timeout):
+        headers = Message()
+        raise urllib.error.HTTPError(request.full_url, 401, "unauthorized", headers, io.BytesIO(b"invalid key"))
+
+    monkeypatch.setattr("opencode_human_bot.autonomous.urllib.request.urlopen", unauthorized)
+    with pytest.raises(ProviderError, match="401"):
+        provider.complete([{"role": "user", "content": "test"}], on_delta=lambda _: None)
+
+
+def test_agent_validation_runs_only_in_isolated_copy_and_blocks_remote_tools(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "module.py").write_text("value = 1\n", encoding="utf-8")
+    (source / "broken.py").write_text("def broken(:\n", encoding="utf-8")
+    (source / ".ssh").mkdir()
+    (source / ".ssh" / "config").write_text("Host private-host\n", encoding="utf-8")
+    (source / "production").mkdir()
+    (source / "production" / "database.yaml").write_text("dsn: production-secret\n", encoding="utf-8")
+    (source / "deployment").mkdir()
+    (source / "deployment" / "server.yaml").write_text("host: production\n", encoding="utf-8")
+    (source / "settings.ini").write_text("password = UnquotedSecretValue123456789\n", encoding="utf-8")
+    host = tmp_path / "host"
+    host.mkdir()
+    engine = CodingEngine(host, tmp_path / "state.sqlite3")
+    prompts = []
+
+    class FakeProvider:
+        def __init__(self, config):
+            pass
+
+        def complete(self, messages, on_delta=None):
+            prompts.append(messages[-1]["content"])
+            assert "UnquotedSecretValue" not in json.dumps(messages)
+            assert "private-host" not in json.dumps(messages)
+            assert "production-secret" not in json.dumps(messages)
+            content = json.dumps({"done": True, "summary": "Ready for validation", "changes": []})
+            if on_delta:
+                on_delta(content)
+            return {"choices": [{"message": {"content": content}}], "usage": {}}
+
+    monkeypatch.setattr("opencode_human_bot.autonomous.ChatProvider", FakeProvider)
+    try:
+        session = engine.autonomous.start(source, "Inspect code", api_key="test-key", approved=True)
+        result = _wait_for_agent(engine.autonomous, session["id"], {"completed", "failed"})
+        assert result["status"] == "completed", result
+        with pytest.raises(PermissionError, match="approval"):
+            engine.autonomous.run_validation(session["id"], ["python3", "-m", "compileall", "-q", "module.py"])
+        with pytest.raises(PermissionError, match="outside the isolated workspace"):
+            engine.autonomous.run_validation(
+                session["id"], [sys.executable, "-m", "pytest", str(source / "module.py")], approved=True)
+        workspace = Path(result["workspace"])
+        assert not (workspace / ".ssh").exists()
+        assert not (workspace / "production").exists()
+        assert not (workspace / "deployment").exists()
+        assert result["copy"]["skipped_secrets"] >= 3
+        compile_result = engine.autonomous.run_validation(
+            session["id"], [sys.executable, "-m", "compileall", "-q", "module.py"], approved=True)
+        assert compile_result["returncode"] == 0
+        assert (source / "__pycache__").exists() is False
+        assert (workspace / "__pycache__").exists()
+        with pytest.raises(PermissionError, match="blocked"):
+            engine.autonomous.run_validation(session["id"], ["ssh", "production-host"], approved=True)
+        failed = engine.autonomous.run_validation(
+            session["id"], [sys.executable, "-m", "compileall", "-q", "broken.py"], approved=True)
+        assert failed["returncode"] != 0
+        assert engine.autonomous.status(session["id"])["status"] == "paused"
+        resumed = engine.autonomous.resume(session["id"])
+        final = _wait_for_agent(engine.autonomous, resumed["id"], {"completed", "failed"})
+        assert final["status"] == "completed", final
+        assert "PREVIOUS USER-APPROVED VALIDATION RESULT" in prompts[-1]
+        assert '"returncode": 1' in prompts[-1]
+        assert engine.autonomous.report(session["id"])["validation"]["returncode"] == failed["returncode"]
+    finally:
+        engine.close()
+
+
+
+def test_autonomous_session_recovers_after_engine_restart(tmp_path, monkeypatch):
+    source = tmp_path / "project"
+    source.mkdir()
+    (source / "module.py").write_text("value = 1\n", encoding="utf-8")
+    host = tmp_path / "host"
+    host.mkdir()
+    database = tmp_path / "state.sqlite3"
+    started = threading.Event()
+    release = threading.Event()
+    seen = []
+
+    class RestartProvider:
+        def __init__(self, config):
+            seen.append((config.base_url, config.api_key))
+
+        def complete(self, messages, on_delta=None):
+            if len(seen) == 1:
+                started.set()
+                assert release.wait(3)
+                payload = {"done": False, "summary": "Safe pause", "changes": []}
+            else:
+                payload = {"done": True, "summary": "Resumed after restart", "changes": []}
+            content = json.dumps(payload)
+            if on_delta:
+                on_delta(content)
+            return {"choices": [{"message": {"content": content}}], "usage": {}}
+
+    monkeypatch.setattr("opencode_human_bot.autonomous.ChatProvider", RestartProvider)
+    engine = CodingEngine(host, database)
+    session_id = None
+    try:
+        session = engine.autonomous.start(source, "Inspect module", provider="openai-compatible", model="fixture",
+                                          base_url="https://api.example.test/v1", api_key="first-ephemeral-key",
+                                          duration_seconds=60, approved=True)
+        session_id = session["id"]
+        assert started.wait(2)
+        engine.autonomous.pause(session_id)
+        release.set()
+        paused = _wait_for_agent(engine.autonomous, session_id, {"paused", "failed"})
+        assert paused["status"] == "paused", paused
+    finally:
+        release.set()
+        engine.close()
+
+    restarted = CodingEngine(host, database)
+    try:
+        recovered = restarted.autonomous.status(session_id)
+        assert recovered["status"] == "paused"
+        resumed = restarted.autonomous.resume(session_id, api_key="second-ephemeral-key")
+        completed = _wait_for_agent(restarted.autonomous, resumed["id"], {"completed", "failed"})
+        assert completed["status"] == "completed", completed
+        assert seen == [("https://api.example.test/v1", "first-ephemeral-key"),
+                        ("https://api.example.test/v1", "second-ephemeral-key")]
+        stored = restarted.store.execute("SELECT state_json FROM agent_sessions WHERE id=?", (session_id,)).fetchone()[0]
+        assert "first-ephemeral-key" not in stored and "second-ephemeral-key" not in stored
+    finally:
+        restarted.close()
+
+
+
+def test_agent_ignores_identical_file_rewrites(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    original = "value = 1\n"
+    (source / "module.py").write_text(original, encoding="utf-8")
+    host = tmp_path / "host"
+    host.mkdir()
+    engine = CodingEngine(host, tmp_path / "state.sqlite3")
+
+    class NoOpProvider:
+        def __init__(self, config):
+            pass
+
+        def complete(self, messages, on_delta=None):
+            content = json.dumps({"done": True, "summary": "No additional change needed.",
+                                  "changes": [{"path": "module.py", "content": original}]})
+            if on_delta:
+                on_delta(content)
+            return {"choices": [{"message": {"content": content}}], "usage": {}}
+
+    monkeypatch.setattr("opencode_human_bot.autonomous.ChatProvider", NoOpProvider)
+    try:
+        session = engine.autonomous.start(source, "Inspect module", api_key="test-key", approved=True)
+        result = _wait_for_agent(engine.autonomous, session["id"], {"completed", "failed"})
+        assert result["status"] == "completed", result
+        assert result["checkpoints"] == []
+        assert result["changed_files"] == []
+        assert engine.autonomous.diff(session["id"]) == ""
+        assert (source / "module.py").read_text(encoding="utf-8") == original
+    finally:
+        engine.close()

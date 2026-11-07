@@ -40,6 +40,14 @@ code --install-extension .\vscode-extension\opencode-human-bot-0.1.0.vsix
 
 Set `opencodeHumanBot.pythonPath` to the virtual environment's Python executable if `python` on the extension host's `PATH` is not the environment where the package was installed. Choose `native` editing by default. Physical mode requires an interactive desktop and should only be enabled when VS Code is the foreground application.
 
+### Autonomous AI mode
+
+In the **Autonomous Local Development** dashboard, use **API KEY** to store a key for the selected provider in VS Code SecretStorage. Select a local folder, or clone a public HTTPS GitHub URL through the confirmation dialog. Describe the task, choose a provider/model, set a duration (up to 24 hours) and optional break between steps, then press **START**. The extension confirms provider/source transmission before starting. Eligible source text is sent to that provider; do not use it with repositories whose source must not leave your machine.
+
+The engine creates a new local branch copy under `.opencode-human-bot/agent-workspaces/`; it does not edit the source repository, run code during cloning, push, or deploy. The AI worker itself has no shell tools. To test a paused or completed session, inspect the repo's test script, enter a JSON argument array such as `["python3", "-m", "pytest", "-q"]`, and choose **RUN ISOLATED TESTS**; the command runs only after a modal confirmation, inside the isolated copy. Resume is an explicit action. A failed result is saved for review; if you explicitly resume, that output is sent to the configured provider with the source context again.
+
+The current AI mode does not implement provider fallback, model tool calling, automatic test-driven correction cycles, or AI edits via the VS Code WorkspaceEdit/physical-typing path. Existing native/physical editing controls apply to the deterministic workflow, not to the isolated autonomous workspace. Provider API availability, model names, and pricing depend on your account.
+
 Physical mode settings are under `opencodeHumanBot.desktop`: `typingInterval`, `mouseDuration`, and `actionDelay` control pacing; `coordinates` can override Explorer/editor/terminal positions and map a relative path to Explorer click points, e.g. `{ "explorer_items": { "src/main.py": [[38, 84], [140, 160], [155, 225]] } }`; `cursor_line` moves the caret to a line before typing; `captureScreenshots` controls staged desktop captures. The emergency-stop button and `Ctrl+Alt+Escape` shortcut stop physical work. Focus loss halts keyboard input and restores the checkpoint when possible.
 
 For a disposable physical test, open the Command Palette and run **OpenCode Human Bot: Open Folder in New Window**, then select the test project. This uses VS Code's `vscode.openFolder` command with `forceNewWindow: true`; it does not replace the current trading workspace.
