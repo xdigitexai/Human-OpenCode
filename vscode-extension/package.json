@@ -1,17 +1,18 @@
 {
   "name": "opencode-human-bot",
   "displayName": "OpenCode Human Bot",
-  "description": "Deterministic, repository-driven coding automation. No AI services or models.",
+  "description": "Local-first AI coding sessions with isolated workspaces, durable checkpoints, and physical editor safeguards.",
   "version": "0.1.0",
   "publisher": "local",
   "engines": { "vscode": "^1.96.0" },
   "categories": ["Other"],
-  "activationEvents": ["onView:opencodeHumanBot.sidebar", "onCommand:opencodeHumanBot.emergencyStop", "onCommand:opencodeHumanBot.openFolderInNewWindow"],
+    "activationEvents": ["onView:opencodeHumanBot.sidebar", "onCommand:opencodeHumanBot.emergencyStop", "onCommand:opencodeHumanBot.openFolderInNewWindow", "onCommand:opencodeHumanBot.configureApiKey"],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
       { "command": "opencodeHumanBot.emergencyStop", "title": "OpenCode Human Bot: Emergency Stop" },
-      { "command": "opencodeHumanBot.openFolderInNewWindow", "title": "OpenCode Human Bot: Open Folder in New Window" }
+      { "command": "opencodeHumanBot.openFolderInNewWindow", "title": "OpenCode Human Bot: Open Folder in New Window" },
+      { "command": "opencodeHumanBot.configureApiKey", "title": "OpenCode Human Bot: Configure AI Provider API Key" }
     ],
     "keybindings": [{ "command": "opencodeHumanBot.emergencyStop", "key": "ctrl+alt+escape" }],
     "viewsContainers": { "activitybar": [{ "id": "opencodeHumanBot", "title": "OpenCode Human Bot", "icon": "media/icon.svg" }] },
@@ -20,6 +21,9 @@
       "title": "OpenCode Human Bot",
       "properties": {
         "opencodeHumanBot.pythonPath": { "type": "string", "default": "python", "description": "Python executable used to launch the local engine." },
+        "opencodeHumanBot.ai.provider": { "type": "string", "enum": ["openai", "anthropic", "deepseek", "moonshot", "kimi", "openai-compatible"], "default": "openai", "description": "Provider used by the autonomous coding session. API keys are stored in VS Code SecretStorage." },
+        "opencodeHumanBot.ai.model": { "type": "string", "default": "gpt-4.1-mini", "description": "Provider model name; select a model supported by your account." },
+        "opencodeHumanBot.ai.baseUrl": { "type": "string", "default": "", "description": "Optional HTTPS API base URL for a compatible endpoint. Loopback HTTP is permitted for local testing." },
         "opencodeHumanBot.editingMode": { "type": "string", "enum": ["native", "physical"], "default": "native", "description": "Native uses VS Code edits; physical uses PyAutoGUI keyboard interaction." },
         "opencodeHumanBot.commandTimeoutSeconds": { "type": "number", "default": 300, "minimum": 1, "maximum": 900 },
         "opencodeHumanBot.desktop.typingInterval": { "type": "number", "default": 0.035, "minimum": 0, "maximum": 0.5 },

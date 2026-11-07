@@ -79,6 +79,34 @@ def dispatch(engine: CodingEngine, request: dict[str, Any]) -> Any:
                                   request.get("application_command"),
                                   request.get("ready_timeout", 30), request.get("step_timeout_ms", 10000),
                                   request.get("headless", True))
+    if operation == "agent_start":
+        return engine.autonomous.start(
+            Path(request["repository"]) if request.get("repository") else engine.root,
+            request["task"], request.get("provider", "openai"), request.get("model"),
+            request.get("base_url"), request.get("api_key_env"),
+            request.get("duration_seconds", 14_400), request.get("max_iterations", 50),
+            request.get("approved") is True, request.get("api_key"), request.get("pace_seconds", 0))
+    if operation == "agent_status":
+        if request.get("session_id"):
+            return engine.autonomous.status(request["session_id"])
+        return engine.autonomous.list_sessions(request.get("limit", 20))
+    if operation == "agent_pause":
+        return engine.autonomous.pause(request["session_id"])
+    if operation == "agent_resume" or operation == "agent_restart":
+        return engine.autonomous.resume(request["session_id"], request.get("api_key"))
+    if operation == "agent_stop":
+        return engine.autonomous.stop(request["session_id"])
+    if operation == "agent_report":
+        return engine.autonomous.report(request["session_id"])
+    if operation == "agent_validate":
+        return engine.autonomous.run_validation(request["session_id"], request["command"],
+                                                request.get("approved") is True,
+                                                request.get("timeout", 300))
+    if operation == "agent_diff":
+        return {"session_id": request["session_id"], "diff": engine.autonomous.diff(request["session_id"])}
+    if operation == "agent_rollback":
+        return engine.autonomous.rollback(request["session_id"], request["checkpoint_id"],
+                                          request.get("approved") is True)
     raise ValueError(f"Unknown operation: {operation}")
 
 

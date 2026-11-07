@@ -56,11 +56,13 @@ class CodingEngine:
         self.cache = self.root / ".opencode-human-bot" / "repositories"
         self.cache.mkdir(parents=True, exist_ok=True)
         self.desktop = DesktopController(self)
+        from .autonomous import AutonomousAgent
         from .browser import BrowserAutomation
         from .repairs import RepairEngine
 
         self.repairs = RepairEngine(self)
         self.browser = BrowserAutomation(self)
+        self.autonomous = AutonomousAgent(self)
 
     def _log(self, category: str, message: str) -> None:
         self.store.execute("INSERT INTO events(created_at,category,message) VALUES(?,?,?)",
@@ -494,5 +496,6 @@ class CodingEngine:
             (min(max(limit, 1), 500),)).fetchall()]
 
     def close(self) -> None:
+        self.autonomous.close()
         self.desktop.close()
         self.store.close()

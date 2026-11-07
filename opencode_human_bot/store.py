@@ -49,6 +49,21 @@ class Store:
                 error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS desktop_tasks_status ON desktop_tasks(status, created_at);
+            CREATE TABLE IF NOT EXISTS agent_sessions (
+                id TEXT PRIMARY KEY, source_root TEXT NOT NULL, workspace TEXT NOT NULL,
+                task TEXT NOT NULL, status TEXT NOT NULL, control TEXT NOT NULL,
+                iteration INTEGER NOT NULL DEFAULT 0, max_iterations INTEGER NOT NULL,
+                duration_seconds INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL,
+                state_json TEXT NOT NULL, last_error TEXT, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS agent_sessions_status ON agent_sessions(status, created_at);
+            CREATE TABLE IF NOT EXISTS agent_journal (
+                id INTEGER PRIMARY KEY, session_id TEXT NOT NULL REFERENCES agent_sessions(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL, category TEXT NOT NULL, message TEXT NOT NULL,
+                details_json TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS agent_journal_session ON agent_journal(session_id, id);
             CREATE TABLE IF NOT EXISTS verified_repairs (
                 id TEXT PRIMARY KEY, rule_id TEXT NOT NULL, language TEXT NOT NULL,
                 target_glob TEXT NOT NULL, operation TEXT NOT NULL, before_text TEXT,

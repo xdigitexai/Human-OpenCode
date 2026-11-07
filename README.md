@@ -1,10 +1,10 @@
 # OpenCode Human Bot
 
-A deterministic, **no-AI** coding-automation bot: it indexes source that already
-exists, ranks it with fixed lexical rules, and only proposes exact-anchor
-replacements derived from a user-selected, licensed source candidate. It does
-not generate code from a task description, and every mutation, command,
-rollback, screenshot and browser run requires explicit approval.
+A local-first coding workbench with deterministic, approval-gated workflows and
+an opt-in AI development agent. The AI agent uses a configured external model,
+works only in a disposable local Git branch copy, records file checkpoints and
+requires a separate user approval before running a supported validation command.
+The original repository is not the AI write target.
 
 An independent Python engine plus a VS Code extension. See
 [ARCHITECTURE.md](ARCHITECTURE.md) for the design and implemented scope,
@@ -22,6 +22,47 @@ for the approval boundaries and limitations.
   screenshots, per-step outcomes, and it stops only the process it started.
 - `vscode-extension/` ships the sidebar, the native/physical editing modes and
   the `Ctrl+Alt+Escape` emergency stop.
+- `opencode_human_bot/autonomous.py` provides provider adapters, streaming,
+  persistent sessions, isolated-copy editing, checkpoints, pause/resume/stop,
+  status/reporting, and a constrained approved-test runner.
+
+## Autonomous AI sessions (opt-in)
+
+Select a local repository folder or enter a public HTTPS GitHub URL, configure a
+provider key with **API KEY** (stored in VS Code SecretStorage), describe the
+task, then press **START**. OpenAI, Anthropic, DeepSeek, Moonshot/Kimi, and
+OpenAI-compatible endpoints are supported. The source is copied to a local
+`agent/<session-id>` Git branch under `.opencode-human-bot/agent-workspaces/`;
+the original folder and remote are not edited. Eligible source/documentation
+files are sent to the provider in bounded context snapshots. Environment,
+credential, generated/dependency, binary, oversized, and symlinked files are
+excluded. The provider receives source data, so choose a provider/privacy policy
+appropriate for the repository.
+
+Sessions persist in SQLite and can run up to 24 hours, with a configured pause
+between implementation steps. START is explicit; PAUSE/STOP interrupt streamed
+responses before any generated changes are applied. Each real file change is
+atomic in the isolated copy and creates a recoverable file-content checkpoint.
+STATUS shows the current phase and real journal activity; REPORT/REVIEW displays
+the unified diff and validation record; ROLLBACK restores only the latest
+checkpoint in the isolated workspace. API keys are not written to the session
+database. Resuming explicitly sends eligible source context and any saved
+validation output to the provider again.
+
+The agent does not automatically run tests or repository scripts. **RUN ISOLATED
+TESTS** requires confirmation, runs in the copied workspace with a reduced,
+private environment, and permits only recognized local test/lint/compile
+commands. Review package test scripts before approval: allowed build/test tools
+can still execute repository code. Direct SSH/SCP/SFTP/deployment/production
+clients are blocked. There is no network sandbox around a user-approved test
+script.
+
+This is a guarded first autonomous implementation, not a full tool-using agent:
+provider fallback, model tool-calling, a multi-session task queue, AI-driven error-correction cycles,
+physical typing of AI edits, and native VS Code WorkspaceEdit application are
+not implemented. AI changes are written into the isolated local copy by the
+engine; the existing native/physical workflows remain separate. The model's
+self-review is advisory and does not replace a human diff review or tests.
 
 ## Editing modes
 
@@ -80,4 +121,6 @@ Operations: `inspect`, `index`, `add_local_repository`, `search_github`,
 `clone`, `search`, `plan`, `add_replacement`, `apply`, `command`, `rollback`,
 `screenshot`, `desktop_start`, `desktop_status`, `desktop_verify_file`,
 `desktop_approve_command`, `desktop_cancel`, `propose_repair`,
-`apply_repair`, `browser_run`. Approval flags are never implied.
+`apply_repair`, `browser_run`, `agent_start`, `agent_status`, `agent_pause`,
+`agent_resume`/`agent_restart`, `agent_stop`, `agent_report`, `agent_diff`,
+`agent_rollback`, `agent_validate`. Approval flags are never implied.

@@ -91,10 +91,15 @@ class Sidebar implements vscode.WebviewViewProvider {
   private polling = false;
   private activeTestTerminal?: vscode.Terminal;
   private readonly commandPrompts = new Set<string>();
+  private agentRepository: string;
+  private agentSessionId?: string;
+  private agentPolling = false;
 
   constructor(private readonly context: vscode.ExtensionContext,
               private readonly root: string,
-              private readonly bridge: PythonBridge) {}
+              private readonly bridge: PythonBridge) {
+    this.agentRepository = root;
+  }
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
@@ -112,9 +117,10 @@ class Sidebar implements vscode.WebviewViewProvider {
     try {
       this.inspection = await this.bridge.request("inspect");
       this.detectedTests = this.inspection.languages?.[0]?.tests ?? [];
-      const [repositories, history, desktopTasks] = await Promise.all([
+      const [repositories, history, desktopTasks, agentSessions] = await Promise.all([
         this.bridge.request("repositories"), this.bridge.request("history", { limit: 30 }),
-        this.bridge.request<JsonRecord[]>("desktop_status", { limit: 20 })
+        this.bridge.request<JsonRecord[]>("desktop_status", { limit: 20 }),
+        this.bridge.request<JsonRecord[]>("agent_status", { limit: 20 })
       ]);
       const activeTask = desktopTasks.find((task: JsonRecord) =>
         ["queued", "running", "verify_file", "awaiting_command_approval", "command_ready", "command_result"].includes(task.status));
@@ -122,7 +128,16 @@ class Sidebar implements vscode.WebviewViewProvider {
         this.desktopTaskId = activeTask.id;
         this.pollDesktop();
       }
-      this.post("overview", { inspection: this.inspection, repositories, history, desktopTasks });
+      const activeAgent = agentSessions.find((session: JsonRecord) =>
+        ["queued", "running", "paused", "interrupted"].includes(session.status));
+      const latestAgent = activeAgent || agentSessions[0];
+      this.agentSessionId = latestAgent?.id;
+      if (activeAgent) this.pollAgent();
+      const ai = vscode.workspace.getConfiguration("opencodeHumanBot.ai");
+      this.post("overview", { inspection: this.inspection, repositories, history, desktopTasks,
+        agentSessions, agentRepository: this.agentRepository,
+        agentConfig: { provider: ai.get("provider", "openai"), model: ai.get("model", ""),
+          baseUrl: ai.get("baseUrl", "") } });
     } catch (error) { this.error(error); }
   }
 
@@ -248,6 +263,125 @@ class Sidebar implements vscode.WebviewViewProvider {
         case "showOutput":
           vscode.commands.executeCommand("workbench.action.output.toggleOutput");
           return;
+        case "agentSelectRepository": {
+          const selected = await vscode.window.showOpenDialog({ canSelectFiles: false, canSelectFolders: true,
+            canSelectMany: false, openLabel: "Use repository for isolated AI work" });
+          if (!selected?.[0]) return;
+          this.agentRepository = selected[0].fsPath;
+          this.post("agentRepository", this.agentRepository);
+          return;
+        }
+        case "agentConfigureKey":
+          return await this.configureApiKey();
+        case "agentCloneRepository": {
+          const url = String(value.url || "").trim();
+          if (!url) throw new Error("Enter a public HTTPS GitHub repository URL");
+          const choice = await vscode.window.showWarningMessage(
+            `Clone public repository ${url} into the local cache, then send eligible source files to the selected AI provider for work in a separate isolated copy? No repository scripts will be run by cloning.`,
+            { modal: true }, "Clone public repository");
+          if (choice !== "Clone public repository") return;
+          const repository = await this.bridge.request<JsonRecord>("clone", { url, approved: true });
+          this.agentRepository = repository.root;
+          this.post("agentRepository", this.agentRepository);
+          void vscode.window.showInformationMessage(`Selected local clone ${repository.name} for isolated AI work.`);
+          return;
+        }
+        case "agentStart": {
+          const provider = String(value.provider || "openai");
+          const key = await this.context.secrets.get(`opencodeHumanBot.providerKey.${provider}`);
+          const choice = await vscode.window.showWarningMessage(
+            `Send repository source from ${this.agentRepository} to ${provider} (${value.model || "provider default"}) and edit only a new isolated local copy? No shell commands, deployment, SSH, or automatic push will be available.`,
+            { modal: true }, "Start isolated AI session");
+          if (choice !== "Start isolated AI session") return;
+          const durationHours = Math.min(Math.max(Number(value.durationHours) || 4, 1 / 60), 24);
+          const session = await this.bridge.request<JsonRecord>("agent_start", {
+            repository: this.agentRepository, task: String(value.task || ""), provider,
+            model: String(value.model || "").trim() || undefined,
+            base_url: String(value.baseUrl || "").trim() || undefined,
+            duration_seconds: Math.round(durationHours * 3600), approved: true,
+            pace_seconds: Math.min(Math.max(Number(value.paceSeconds) || 0, 0), 600),
+            api_key: key || undefined
+          });
+          this.agentSessionId = session.id;
+          this.post("agentStatus", session);
+          this.pollAgent();
+          return;
+        }
+        case "agentPause":
+        case "agentStop": {
+          if (!this.agentSessionId) throw new Error("There is no active autonomous session");
+          const session = await this.bridge.request<JsonRecord>(type === "agentPause" ? "agent_pause" : "agent_stop",
+            { session_id: this.agentSessionId });
+          this.post("agentStatus", session);
+          this.pollAgent();
+          return;
+        }
+        case "agentResume": {
+          if (!this.agentSessionId) throw new Error("Select a paused or interrupted session first");
+          const current = await this.bridge.request<JsonRecord>("agent_status", { session_id: this.agentSessionId });
+          const choice = await vscode.window.showWarningMessage(
+            `Resume ${current.provider}/${current.model} on the isolated copy? Eligible repository context and any saved validation output will be sent to this provider again. No test runs or remote edits will happen automatically.`,
+            { modal: true }, "Resume isolated session");
+          if (choice !== "Resume isolated session") return;
+          const provider = String(current.provider || "openai");
+          const key = await this.context.secrets.get(`opencodeHumanBot.providerKey.${provider}`);
+          const session = await this.bridge.request<JsonRecord>("agent_resume", {
+            session_id: this.agentSessionId, api_key: key || undefined
+          });
+          this.post("agentStatus", session);
+          this.pollAgent();
+          return;
+        }
+        case "agentReport": {
+          if (!this.agentSessionId) throw new Error("There is no autonomous session to report");
+          const report = await this.bridge.request<JsonRecord>("agent_report", { session_id: this.agentSessionId });
+          this.post("agentReport", report);
+          const fence = "`".repeat(3);
+          const content = [
+            `# Session ${report.session.id}`, "", "## Status", "", report.session.status, "",
+            "## Summary", "", report.session.summary || "No summary yet.", "",
+            "## Validation", "", JSON.stringify(report.validation, null, 2), "",
+            "## Unified diff", "", `${fence}diff`, report.diff || "No changes yet.", fence, "",
+            "## Journal", "", ...report.journal.map((entry: JsonRecord) =>
+              `- ${entry.created_at} **${entry.category}** — ${entry.message}`)
+          ].join("\n");
+          const document = await vscode.workspace.openTextDocument({ language: "markdown", content });
+          await vscode.window.showTextDocument(document, { preview: true });
+          return;
+        }
+        case "agentValidate": {
+          if (!this.agentSessionId) throw new Error("There is no autonomous session to validate");
+          let command: string[];
+          try { command = JSON.parse(String(value.command || "")); }
+          catch { throw new Error('Enter the test command as a JSON array, e.g. ["python3", "-m", "pytest", "-q"]'); }
+          if (!Array.isArray(command) || !command.every(part => typeof part === "string")) {
+            throw new Error("Validation command must be a JSON array of strings");
+          }
+          const choice = await vscode.window.showWarningMessage(
+            `Run this reviewed command in the isolated copy only?\n${command.join(" ")}\nReview the repository test script first. SSH, deployment, production and remote tools are blocked.`,
+            { modal: true }, "Run isolated tests");
+          if (choice !== "Run isolated tests") return;
+          const result = await this.bridge.request("agent_validate", {
+            session_id: this.agentSessionId, command, approved: true,
+            timeout: vscode.workspace.getConfiguration("opencodeHumanBot").get("commandTimeoutSeconds", 300)
+          });
+          this.post("agentValidation", result);
+          this.post("agentStatus", await this.bridge.request("agent_status", { session_id: this.agentSessionId }));
+          return;
+        }
+        case "agentRollback": {
+          if (!this.agentSessionId || !value.checkpointId) throw new Error("No agent checkpoint was selected");
+          const choice = await vscode.window.showWarningMessage(
+            `Restore the isolated agent workspace to checkpoint ${value.checkpointId}?`,
+            { modal: true }, "Restore checkpoint");
+          if (choice !== "Restore checkpoint") return;
+          const result = await this.bridge.request("agent_rollback", {
+            session_id: this.agentSessionId, checkpoint_id: value.checkpointId, approved: true
+          });
+          this.post("agentStatus", await this.bridge.request("agent_status", { session_id: this.agentSessionId }));
+          this.post("result", result);
+          return;
+        }
       }
     } catch (error) { this.error(error); }
   }
@@ -334,6 +468,41 @@ class Sidebar implements vscode.WebviewViewProvider {
     await vscode.commands.executeCommand("vscode.openFolder", selected[0], {
       forceNewWindow: true, noRecentEntry: true,
     });
+  }
+
+  async configureApiKey(): Promise<void> {
+    const provider = await vscode.window.showQuickPick(
+      ["openai", "anthropic", "deepseek", "moonshot", "kimi", "openai-compatible"],
+      { placeHolder: "Choose the provider whose API key you want to store securely" });
+    if (!provider) return;
+    const key = await vscode.window.showInputBox({
+      prompt: `API key for ${provider}; stored in VS Code SecretStorage and not written to the project or session database`,
+      password: true, ignoreFocusOut: true,
+      validateInput: value => value.trim() ? undefined : "Enter a non-empty API key"
+    });
+    if (key === undefined) return;
+    await this.context.secrets.store(`opencodeHumanBot.providerKey.${provider}`, key.trim());
+    void vscode.window.showInformationMessage(`The ${provider} API key was stored securely.`);
+  }
+
+  private pollAgent(): void {
+    if (this.agentPolling || !this.agentSessionId) return;
+    this.agentPolling = true;
+    void this.pollAgentOnce().finally(() => { this.agentPolling = false; });
+  }
+
+  private async pollAgentOnce(): Promise<void> {
+    if (!this.agentSessionId) return;
+    try {
+      const session = await this.bridge.request<JsonRecord>("agent_status", { session_id: this.agentSessionId });
+      if (!session) return;
+      this.post("agentStatus", session);
+      if (["completed", "failed", "stopped", "paused", "interrupted"].includes(session.status)) return;
+    } catch (error) {
+      this.error(error);
+      return;
+    }
+    setTimeout(() => this.pollAgent(), 1500);
   }
 
   private pollDesktop(): void {
@@ -469,6 +638,29 @@ class Sidebar implements vscode.WebviewViewProvider {
           <div class="section-head"><div><label>PROJECT</label><h2 id="project-name">Loading workspace</h2></div><button id="inspect" class="icon-btn" title="Inspect project">⌕</button></div>
           <div class="action-row"><span class="meta">Physical desktop control</span><button id="emergency-stop" class="secondary" title="Emergency stop (Ctrl+Alt+Escape)">Stop</button></div>
           <div id="project-facts" class="facts"></div>
+          <div class="divider"></div>
+          <label>AUTONOMOUS LOCAL DEVELOPMENT</label>
+          <div class="inline"><div id="agent-repository" class="meta">Current workspace</div><button id="agent-select-repo" class="secondary">Select</button><button id="agent-configure-key" class="secondary">API KEY</button></div>
+          <div class="inline"><input id="agent-github-url" placeholder="Public GitHub HTTPS URL"><button id="agent-clone-repo" class="secondary">CLONE</button></div>
+          <div class="meta">AI edits remain in a disposable local branch copy; native/physical editing modes remain separate deterministic workflows.</div>
+          <textarea id="agent-task" rows="3" placeholder="Describe the code change for the AI agent"></textarea>
+          <div class="form-grid">
+            <select id="agent-provider" aria-label="AI provider">
+              <option value="openai">OpenAI</option><option value="anthropic">Anthropic</option>
+              <option value="deepseek">DeepSeek</option><option value="moonshot">Moonshot</option>
+              <option value="kimi">Kimi</option><option value="openai-compatible">OpenAI-compatible</option>
+            </select>
+            <input id="agent-model" placeholder="Model (optional; provider default)">
+            <input id="agent-base-url" placeholder="Optional HTTPS API base URL">
+            <input id="agent-duration" type="number" min="0.02" max="24" step="0.5" value="4" aria-label="Session duration in hours">
+            <select id="agent-pace" aria-label="Pause between implementation steps"><option value="0">No review break</option><option value="10">10-second review break</option><option value="30">30-second review break</option><option value="60">60-second review break</option><option value="300">5-minute review break</option></select>
+          </div>
+          <div class="action-row"><button id="agent-start" class="primary">START</button><button id="agent-pause" class="secondary">PAUSE</button><button id="agent-resume" class="secondary">RESUME</button><button id="agent-stop" class="secondary">STOP</button></div>
+          <div id="agent-status" class="result-box empty">No autonomous session loaded.</div>
+          <input id="agent-validation-command" value='["python3", "-m", "pytest", "-q"]' aria-label="Validation command as a JSON argument array">
+          <div class="action-row"><button id="agent-validate" class="secondary">RUN ISOLATED TESTS</button><button id="agent-report" class="secondary">REPORT / REVIEW</button><button id="agent-rollback" class="secondary">ROLLBACK LAST</button></div>
+          <div id="agent-journal" class="results"></div>
+          <div class="divider"></div>
           <div id="desktop-status" class="result-box empty">Physical desktop queue is idle.</div>
           <div id="desktop-queue" class="results"></div>
           <button id="index" class="secondary full">Index workspace source</button>
@@ -520,6 +712,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(bridge,
     vscode.commands.registerCommand("opencodeHumanBot.emergencyStop", () => sidebar.emergencyStop()),
     vscode.commands.registerCommand("opencodeHumanBot.openFolderInNewWindow", () => sidebar.openFolderInNewWindow()),
+    vscode.commands.registerCommand("opencodeHumanBot.configureApiKey", () => sidebar.configureApiKey()),
     vscode.window.registerWebviewViewProvider("opencodeHumanBot.sidebar", sidebar));
 }
 
