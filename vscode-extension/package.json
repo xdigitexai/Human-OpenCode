@@ -1,0 +1,37 @@
+{
+  "name": "opencode-human-bot",
+  "displayName": "OpenCode Human Bot",
+  "description": "Deterministic, repository-driven coding automation. No AI services or models.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "engines": { "vscode": "^1.96.0" },
+  "categories": ["Other"],
+  "activationEvents": ["onView:opencodeHumanBot.sidebar", "onCommand:opencodeHumanBot.emergencyStop", "onCommand:opencodeHumanBot.openFolderInNewWindow"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "opencodeHumanBot.emergencyStop", "title": "OpenCode Human Bot: Emergency Stop" },
+      { "command": "opencodeHumanBot.openFolderInNewWindow", "title": "OpenCode Human Bot: Open Folder in New Window" }
+    ],
+    "keybindings": [{ "command": "opencodeHumanBot.emergencyStop", "key": "ctrl+alt+escape" }],
+    "viewsContainers": { "activitybar": [{ "id": "opencodeHumanBot", "title": "OpenCode Human Bot", "icon": "media/icon.svg" }] },
+    "views": { "opencodeHumanBot": [{ "id": "opencodeHumanBot.sidebar", "name": "OpenCode Human Bot", "type": "webview" }] },
+    "configuration": {
+      "title": "OpenCode Human Bot",
+      "properties": {
+        "opencodeHumanBot.pythonPath": { "type": "string", "default": "python", "description": "Python executable used to launch the local engine." },
+        "opencodeHumanBot.editingMode": { "type": "string", "enum": ["native", "physical"], "default": "native", "description": "Native uses VS Code edits; physical uses PyAutoGUI keyboard interaction." },
+        "opencodeHumanBot.commandTimeoutSeconds": { "type": "number", "default": 300, "minimum": 1, "maximum": 900 },
+        "opencodeHumanBot.desktop.typingInterval": { "type": "number", "default": 0.035, "minimum": 0, "maximum": 0.5 },
+        "opencodeHumanBot.desktop.mouseDuration": { "type": "number", "default": 0.25, "minimum": 0, "maximum": 3 },
+        "opencodeHumanBot.desktop.actionDelay": { "type": "number", "default": 0.6, "minimum": 0, "maximum": 5 },
+        "opencodeHumanBot.desktop.captureScreenshots": { "type": "boolean", "default": true },
+        "opencodeHumanBot.desktop.coordinates": { "type": "object", "default": {}, "description": "Optional screen-coordinate overrides: explorer_x, explorer_y, editor_x, editor_y, terminal_x, terminal_y." },
+        "opencodeHumanBot.desktop.explorerItems": { "type": "object", "default": {}, "description": "Workspace-relative file paths mapped to calibrated Explorer click points, e.g. {\"src/main.py\":[[38,84],[140,160],[155,225]]}." },
+        "opencodeHumanBot.desktop.cursorLine": { "type": "integer", "default": 0, "minimum": 0, "description": "Move the editor caret to this 1-based line before typing; 0 preserves the current caret behavior." }
+      }
+    }
+  },
+  "scripts": { "compile": "tsc -p .", "watch": "tsc -watch -p .", "package": "vsce package --allow-missing-repository --skip-license" },
+  "devDependencies": { "@types/node": "^22.10.0", "@types/vscode": "^1.96.0", "@vscode/vsce": "^4.1.0", "typescript": "^5.7.2" }
+}

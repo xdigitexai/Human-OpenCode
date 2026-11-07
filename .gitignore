@@ -1,0 +1,23 @@
+# Engine local state (SQLite index, cloned repositories, screenshots, checkpoints)
+.opencode-human-bot/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+coverage.xml
+htmlcov/
+
+# Extension build artifacts
+node_modules/
+vscode-extension/out/
+*.vsix
+
+dist/
+build/
+*.egg-info/
+
+# Playwright local runs
+playwright-report/
+test-results/

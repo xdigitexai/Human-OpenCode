@@ -1,0 +1,31 @@
+[project]
+name = "opencode-human-bot"
+version = "0.1.0"
+description = "Deterministic, no-AI coding bot: indexed source, exact-anchor plans, physical VS Code operation"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+codebot = [
+  "tree-sitter-language-pack>=0.9,<1",
+  "PyAutoGUI>=0.9.54,<1",
+  "Pillow>=12,<13",
+  "PyScreeze>=1,<2",
+]
+browser = ["playwright>=1.55,<2"]
+dev = ["pytest>=8.3,<9", "ruff>=0.8,<1"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["opencode_human_bot*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
